@@ -17,17 +17,22 @@ package dhcp6
 
 import (
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net"
 	"strconv"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
+	"github.com/hashicorp/go-hclog"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/insomniacslk/dhcp/dhcpv6/client6"
 	"github.com/insomniacslk/dhcp/iana"
 )
 
 type ClientConfig struct {
+	Logger hclog.Logger
+
 	InterfaceName string // e.g. eth0
 
 	// LocalAddr allows overwriting the source address used for sending DHCPv6
@@ -53,16 +58,25 @@ type ClientConfig struct {
 	// defaults to the hardware address of the interface identified by
 	// InterfaceName.
 	HardwareAddr net.HardwareAddr
+
+	// Configuration previously retrieved
+	CurrentConfig Config
 }
 
 // Config contains the obtained network configuration.
 type Config struct {
-	RenewAfter time.Time   `json:"valid_until"`
-	Prefixes   []net.IPNet `json:"prefixes"` // e.g. 2a02:168:4a00::/48
-	DNS        []string    `json:"dns"`      // e.g. 2001:1620:2777:1::10, 2001:1620:2777:2::20
+	RenewAfter   time.Time   `json:"valid_until"`
+	Addresses    []net.IP    `json:"addresses"`     // IANA or IATA addresses
+	OldAddresses []net.IP    `json:"old_addresses"` // IANA or IATA addresses
+	Prefixes     []net.IPNet `json:"prefixes"`      // e.g. 2a02:168:4a00::/48
+	OldPrefixes  []net.IPNet `json:"old_prefixes"`
+	DNS          []string    `json:"dns"` // e.g. 2001:1620:2777:1::10, 2001:1620:2777:2::20
+	DUID         []byte      `json:"duid"`
+	ServerId     []byte      `json:"server_id"`
 }
 
 type Client struct {
+	log           hclog.Logger
 	interfaceName string
 	hardwareAddr  net.HardwareAddr
 	raddr         *net.UDPAddr
@@ -73,8 +87,7 @@ type Client struct {
 	cfg Config
 	err error
 
-	Conn           net.PacketConn // TODO: unexport
-	transactionIDs []dhcpv6.TransactionID
+	Conn net.PacketConn // TODO: unexport
 
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
@@ -83,6 +96,10 @@ type Client struct {
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
+	if cfg.Logger == nil {
+		cfg.Logger = hclog.L()
+	}
+
 	iface, err := net.InterfaceByName(cfg.InterfaceName)
 	if err != nil {
 		return nil, err
@@ -121,21 +138,26 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 
 	var duid *dhcpv6.Duid
-	if cfg.DUID != nil {
-		var err error
+
+	if cfg.CurrentConfig.DUID != nil {
+		duid, err = dhcpv6.DuidFromBytes(cfg.CurrentConfig.DUID)
+		if err != nil {
+			return nil, err
+		}
+	} else if cfg.DUID != nil {
 		duid, err = dhcpv6.DuidFromBytes(cfg.DUID)
 		if err != nil {
 			return nil, err
 		}
-		fmt.Printf("duid: %T, %v, %#v", duid, duid, duid)
 	} else {
 		duid = &dhcpv6.Duid{
-			Type:          dhcpv6.DUID_LLT,
+			Type:          dhcpv6.DUID_LL,
 			HwType:        iana.HWTypeEthernet,
-			Time:          dhcpv6.GetTime(),
 			LinkLayerAddr: hardwareAddr,
 		}
 	}
+
+	cfg.Logger.Debug("Calculated DUID", "duid", hclog.Fmt("%+v", duid))
 
 	// prepare the socket to listen on for replies
 	conn := cfg.Conn
@@ -148,15 +170,16 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 
 	return &Client{
-		interfaceName:  cfg.InterfaceName,
-		hardwareAddr:   hardwareAddr,
-		timeNow:        time.Now,
-		raddr:          raddr,
-		Conn:           conn,
-		duid:           duid,
-		transactionIDs: cfg.TransactionIDs,
-		ReadTimeout:    client6.DefaultReadTimeout,
-		WriteTimeout:   client6.DefaultWriteTimeout,
+		log:           cfg.Logger,
+		cfg:           cfg.CurrentConfig,
+		interfaceName: cfg.InterfaceName,
+		hardwareAddr:  hardwareAddr,
+		timeNow:       time.Now,
+		raddr:         raddr,
+		Conn:          conn,
+		duid:          duid,
+		ReadTimeout:   client6.DefaultReadTimeout,
+		WriteTimeout:  client6.DefaultWriteTimeout,
 	}, nil
 }
 
@@ -175,6 +198,10 @@ func (c *Client) sendReceive(packet *dhcpv6.Message, expectedType dhcpv6.Message
 		if packet.Type() == dhcpv6.MessageTypeSolicit {
 			expectedType = dhcpv6.MessageTypeAdvertise
 		} else if packet.Type() == dhcpv6.MessageTypeRequest {
+			expectedType = dhcpv6.MessageTypeReply
+		} else if packet.Type() == dhcpv6.MessageTypeRenew {
+			expectedType = dhcpv6.MessageTypeReply
+		} else if packet.Type() == dhcpv6.MessageTypeRelease {
 			expectedType = dhcpv6.MessageTypeReply
 		} else if packet.Type() == dhcpv6.MessageTypeRelayForward {
 			expectedType = dhcpv6.MessageTypeRelayReply
@@ -221,6 +248,107 @@ func (c *Client) sendReceive(packet *dhcpv6.Message, expectedType dhcpv6.Message
 	return adv, nil
 }
 
+func (c *Client) Release() (*dhcpv6.Message, error) {
+	var err error
+	msg, err := dhcpv6.NewMessage()
+	if err != nil {
+		return nil, err
+	}
+	msg.MessageType = dhcpv6.MessageTypeRelease
+	msg.AddOption(dhcpv6.OptClientID(*c.duid))
+	msg.AddOption(dhcpv6.OptElapsedTime(0))
+
+	id := c.iaid()
+
+	iana := &dhcpv6.OptIANA{}
+	copy(iana.IaId[:], id[:])
+
+	for _, i := range c.cfg.Addresses {
+		iana.Options.Add(&dhcpv6.OptIAAddress{
+			IPv6Addr: i,
+		})
+	}
+
+	msg.UpdateOption(iana)
+
+	iapd := &dhcpv6.OptIAPD{IaId: [4]byte{0, 0, 0, 1}}
+
+	for _, i := range c.cfg.Prefixes {
+		pf := i
+		iapd.Options.Add(&dhcpv6.OptIAPrefix{
+			Prefix: &pf,
+		})
+	}
+
+	msg.UpdateOption(iapd)
+
+	if len(c.cfg.ServerId) > 0 {
+		sid, err := dhcpv6.DuidFromBytes(c.cfg.ServerId)
+		if err == nil {
+			msg.AddOption(dhcpv6.OptServerID(*sid))
+		}
+	}
+
+	c.log.Trace("performing release operation", "msg", msg.Summary(), "prefixes", spew.Sdump(c.cfg.Prefixes), "sid", c.cfg.ServerId)
+	reply, err := c.sendReceive(msg, dhcpv6.MessageTypeNone)
+	return reply, err
+}
+
+func (c *Client) iaid() [4]byte {
+	h := fnv.New32()
+	h.Write(c.hardwareAddr)
+
+	var iaid [4]byte
+	copy(iaid[:], h.Sum(nil))
+	return iaid
+}
+
+func (c *Client) renew() (*dhcpv6.Message, error) {
+	var err error
+	msg, err := dhcpv6.NewMessage()
+	if err != nil {
+		return nil, err
+	}
+	msg.MessageType = dhcpv6.MessageTypeRenew
+	msg.AddOption(dhcpv6.OptClientID(*c.duid))
+	msg.AddOption(dhcpv6.OptElapsedTime(0))
+
+	id := c.iaid()
+
+	iana := &dhcpv6.OptIANA{}
+	copy(iana.IaId[:], id[:])
+
+	for _, i := range c.cfg.Addresses {
+		iana.Options.Add(&dhcpv6.OptIAAddress{
+			IPv6Addr: i,
+		})
+	}
+
+	msg.AddOption(iana)
+
+	iapd := &dhcpv6.OptIAPD{IaId: [4]byte{0, 0, 0, 1}}
+
+	for _, i := range c.cfg.Prefixes {
+		pf := i
+		iapd.Options.Add(&dhcpv6.OptIAPrefix{
+			Prefix: &pf,
+		})
+	}
+
+	msg.AddOption(iapd)
+
+	if len(c.cfg.ServerId) > 0 {
+		sid, err := dhcpv6.DuidFromBytes(c.cfg.ServerId)
+		if err == nil {
+			msg.AddOption(dhcpv6.OptServerID(*sid))
+		}
+	}
+
+	c.log.Trace("performing renew operation", "msg", msg.Summary(), "prefixes", spew.Sdump(c.cfg.Prefixes), "sid", c.cfg.ServerId)
+	reply, err := c.sendReceive(msg, dhcpv6.MessageTypeNone)
+	return reply, err
+}
+
 func (c *Client) solicit(solicit *dhcpv6.Message) (*dhcpv6.Message, *dhcpv6.Message, error) {
 	var err error
 	if solicit == nil {
@@ -229,12 +357,17 @@ func (c *Client) solicit(solicit *dhcpv6.Message) (*dhcpv6.Message, *dhcpv6.Mess
 			return nil, nil, err
 		}
 	}
-	if len(c.transactionIDs) > 0 {
-		id := c.transactionIDs[0]
-		c.transactionIDs = c.transactionIDs[1:]
-		solicit.TransactionID = id
+
+	iapd := &dhcpv6.OptIAPD{IaId: [4]byte{0, 0, 0, 1}}
+
+	for _, prefix := range c.cfg.Prefixes {
+		pf := prefix
+		iapd.Options.Add(&dhcpv6.OptIAPrefix{
+			Prefix: &pf,
+		})
 	}
-	solicit.AddOption(&dhcpv6.OptIAPD{IaId: [4]byte{0, 0, 0, 1}})
+
+	solicit.AddOption(iapd)
 	advertise, err := c.sendReceive(solicit, dhcpv6.MessageTypeNone)
 	return solicit, advertise, err
 }
@@ -244,76 +377,160 @@ func (c *Client) request(advertise *dhcpv6.Message) (*dhcpv6.Message, *dhcpv6.Me
 	if err != nil {
 		return nil, nil, err
 	}
+
 	if iapd := advertise.Options.OneIAPD(); iapd != nil {
 		request.AddOption(iapd)
 	}
 
-	if len(c.transactionIDs) > 0 {
-		id := c.transactionIDs[0]
-		c.transactionIDs = c.transactionIDs[1:]
-		request.TransactionID = id
-	}
 	reply, err := c.sendReceive(request, dhcpv6.MessageTypeNone)
 	return request, reply, err
 }
 
 func (c *Client) ObtainOrRenew() bool {
 	c.err = nil // clear previous error
-	_, advertise, err := c.solicit(nil)
-	if err != nil {
-		c.err = err
-		return true
-	}
 
-	c.advertise = advertise
+	var (
+		reply *dhcpv6.Message
+		err   error
+	)
 
-	if iapd := advertise.Options.OneIAPD(); iapd != nil {
-		if status := iapd.Options.Status(); status != nil && status.StatusCode != iana.StatusSuccess {
-			c.err = fmt.Errorf("IAPD error: %v (%v)", status.StatusCode, status.StatusMessage)
-			return false
+	spew.Dump(c.cfg)
+
+	if len(c.cfg.Prefixes) > 0 || len(c.cfg.Addresses) > 0 {
+		c.log.Debug("Sending renew request...")
+		reply, err = c.renew()
+		if err == nil {
+			c.log.Debug("reply from server", "summary", reply.Summary())
+		} else {
+			c.log.Info("error sending renew, proceding with new address", "error", err)
+		}
+
+		if iapd := reply.Options.OneIAPD(); iapd != nil {
+			if status := iapd.Options.Status(); status != nil && status.StatusCode != iana.StatusSuccess {
+				c.log.Error("error reported with renewing IAPD", "status", status.StatusCode.String(), "message", status.StatusMessage)
+				c.log.Info("renew failed, getting new addresses")
+				reply = nil
+			}
 		}
 	}
 
-	_, reply, err := c.request(advertise)
-	if err != nil {
-		c.err = err
-		return true
+	if reply == nil {
+		c.log.Debug("soliciting address")
+
+		_, advertise, err := c.solicit(nil)
+		if err != nil {
+			c.err = err
+			return true
+		}
+
+		c.advertise = advertise
+
+		if iapd := advertise.Options.OneIAPD(); iapd != nil {
+			if status := iapd.Options.Status(); status != nil && status.StatusCode != iana.StatusSuccess {
+				c.err = fmt.Errorf("IAPD error: %v (%v)", status.StatusCode, status.StatusMessage)
+				return false
+			}
+		}
+
+		_, reply, err = c.request(advertise)
+		if err != nil {
+			c.err = err
+			return true
+		}
 	}
+
+	sid := reply.Options.ServerID()
+
+	c.log.Debug("reply from server", "summary", reply.Summary(), "sid", spew.Sdump(sid))
+
 	var newCfg Config
+	newCfg.DUID = c.duid.ToBytes()
+	newCfg.ServerId = sid.ToBytes()
+
+	for _, iana := range reply.Options.IANA() {
+		t1 := c.timeNow().Add(iana.T1)
+		if t1.Before(newCfg.RenewAfter) || newCfg.RenewAfter.IsZero() {
+			newCfg.RenewAfter = t1
+		}
+
+		for _, addr := range iana.Options.Addresses() {
+			if addr.ValidLifetime > 0 {
+				newCfg.Addresses = append(newCfg.Addresses, addr.IPv6Addr)
+			} else {
+				newCfg.OldAddresses = append(newCfg.OldAddresses, addr.IPv6Addr)
+			}
+		}
+	}
+
 	for _, iapd := range reply.Options.IAPD() {
 		t1 := c.timeNow().Add(iapd.T1)
 		if t1.Before(newCfg.RenewAfter) || newCfg.RenewAfter.IsZero() {
 			newCfg.RenewAfter = t1
 		}
+
 		for _, prefix := range iapd.Options.Prefixes() {
-			newCfg.Prefixes = append(newCfg.Prefixes, *prefix.Prefix)
+			if prefix.ValidLifetime > 0 {
+				newCfg.Prefixes = append(newCfg.Prefixes, *prefix.Prefix)
+			} else {
+				newCfg.OldPrefixes = append(newCfg.OldPrefixes, *prefix.Prefix)
+			}
 		}
 	}
+
 	for _, dns := range reply.Options.DNS() {
 		newCfg.DNS = append(newCfg.DNS, dns.String())
 	}
+
+	for _, addr := range c.cfg.Addresses {
+		var isCurrent bool
+
+		for _, newAddr := range newCfg.Addresses {
+			if newAddr.Equal(addr) {
+				isCurrent = true
+				break
+			}
+		}
+
+		if !isCurrent {
+			for _, newAddr := range newCfg.OldAddresses {
+				if newAddr.Equal(addr) {
+					isCurrent = true
+					break
+				}
+			}
+		}
+
+		if !isCurrent {
+			newCfg.OldAddresses = append(newCfg.OldAddresses, addr)
+		}
+	}
+
+	for _, prefix := range c.cfg.Prefixes {
+		var isCurrent bool
+
+		for _, newPrefix := range newCfg.Prefixes {
+			if newPrefix.IP.Equal(prefix.IP) {
+				isCurrent = true
+				break
+			}
+		}
+
+		if !isCurrent {
+			for _, newPrefix := range newCfg.OldPrefixes {
+				if newPrefix.IP.Equal(prefix.IP) {
+					isCurrent = true
+					break
+				}
+			}
+		}
+
+		if !isCurrent {
+			newCfg.OldPrefixes = append(newCfg.OldPrefixes, prefix)
+		}
+	}
+
 	c.cfg = newCfg
 	return true
-}
-
-func (c *Client) Release() (release *dhcpv6.Message, reply *dhcpv6.Message, err error) {
-	release, err = dhcpv6.NewRequestFromAdvertise(c.advertise, dhcpv6.WithClientID(*c.duid))
-	if err != nil {
-		return nil, nil, err
-	}
-	release.MessageType = dhcpv6.MessageTypeRelease
-
-	if len(c.transactionIDs) > 0 {
-		id := c.transactionIDs[0]
-		c.transactionIDs = c.transactionIDs[1:]
-		release.TransactionID = id
-	}
-	reply, err = c.sendReceive(release, dhcpv6.MessageTypeNone)
-	return release, reply, err
-}
-
-func (c *Client) Err() error {
-	return c.err
 }
 
 func (c *Client) Config() Config {
